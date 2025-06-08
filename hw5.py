@@ -1,9 +1,13 @@
-import pathlib
+
 import json
+import pathlib
+import sys
+from typing import Union, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import Union, Tuple
+import os
+
 
 class QuestionnaireAnalysis:
     """
@@ -12,16 +16,22 @@ class QuestionnaireAnalysis:
     """
 
     def __init__(self, data_fname: Union[pathlib.Path, str]):
-        self.data_fname = pathlib.Path(data_fname) if isinstance(data_fname, str) else data_fname
-        self.data: pd.DataFrame = pd.DataFrame()
+        try:
+            self.data_fname = pathlib.Path(data_fname)
+        except TypeError:
+            raise TypeError("data_fname must be a string or a Path object")
+
+        if not self.data_fname.exists():
+            raise ValueError("File not found")
+        self.data = None
 
     def read_data(self):
-        """Reads the JSON data into self.data as a DataFrame."""
-        if not self.data_fname.exists():
-            raise ValueError(f"The file {self.data_fname} does not exist.")
-        with open(self.data_fname, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
-        self.data = pd.DataFrame(raw_data)
+        """Reads the json data located in self.data_fname into memory, to
+        the attribute self.data.
+        """
+        with open(self.data_fname, 'r') as f:
+            self.data = pd.DataFrame(json.load(f))
+        self.data.replace("nan", np.nan, inplace=True)
 
     def show_age_distrib(self) -> Tuple[np.ndarray, np.ndarray]:
         """Calculates and plots the age distribution of the participants.
@@ -33,25 +43,21 @@ class QuestionnaireAnalysis:
         bins : np.ndarray
           Bin edges
         """
-        # Convert ages to numeric, handle "nan" strings
-        ages = pd.to_numeric(self.data["age"], errors="coerce").dropna()
-        ages = ages[(ages >= 0) & (ages <= 100)]
+        age_data = pd.to_numeric(self.data['age'], errors='coerce').dropna()
+        hist, bins = np.histogram(age_data, bins=np.arange(0, 110, 10))
         
-        # Create bins [0,10), [10,20), ..., [90,100]
-        bins = np.arange(0, 101, 10)
-        hist, edges = np.histogram(ages, bins=bins)
-
-        # Plot histogram
-        plt.figure(figsize=(10, 6))
-        plt.hist(ages, bins=bins, edgecolor="black", alpha=0.7)
-        plt.xlabel("Age")
-        plt.ylabel("Number of participants")
-        plt.title("Age Distribution of Participants")
-        plt.xticks(bins)
-        plt.grid(axis="y", alpha=0.3)
-        plt.show()
-
-        return hist, edges
+        # Make sure the output directory exists
+        if not os.path.exists('output'):
+            os.makedirs('output')
+        
+        plt.hist(age_data, bins=np.arange(0, 110, 10), edgecolor='black')
+        plt.xlabel('Age')
+        plt.ylabel('Count')
+        plt.title('Age Distribution')
+        plt.savefig('output/age_distribution.png')
+        if 'pytest' not in sys.modules:
+            plt.show()
+        return hist, bins
 
     def remove_rows_without_mail(self) -> pd.DataFrame:
         """Checks self.data for rows with invalid emails, and removes them.
@@ -62,192 +68,105 @@ class QuestionnaireAnalysis:
           A corrected DataFrame, i.e. the same table but with the erroneous rows removed and
           the (ordinal) index after a reset.
         """
-        def is_valid_email(email) -> bool:
+        def is_valid_email(email: str) -> bool:
             if not isinstance(email, str):
                 return False
-            
-            email = email.strip()
-            
-            # Check if email is empty
-            if not email:
+            if email.startswith('@') or email.endswith('@'):
                 return False
-            
-            # Must contain exactly one "@" sign, but not start or end with it
-            if email.count("@") != 1 or email.startswith("@") or email.endswith("@"):
+            if email.startswith('.') or email.endswith('.'):
                 return False
-            
-            # Must contain a "." sign, but not start or end with it
-            if "." not in email or email.startswith(".") or email.endswith("."):
+            if email.count('@') != 1:
                 return False
-            
-            # The letter following "@" must not be "."
-            at_index = email.index("@")
-            if at_index + 1 < len(email) and email[at_index + 1] == ".":
+            at_index = email.index('@')
+            if at_index + 1 >= len(email) or email[at_index + 1] == '.':
                 return False
-            
+            if '.' not in email:
+                return False
             return True
 
-        # Create a copy and apply email validation
-        df_cleaned = self.data[self.data["email"].apply(is_valid_email)].copy()
-        df_cleaned = df_cleaned.reset_index(drop=True)
-        
-        return df_cleaned
+        valid_df = self.data[self.data['email'].apply(is_valid_email)].reset_index(drop=True)
+        return valid_df
 
     def fill_na_with_mean(self) -> Tuple[pd.DataFrame, np.ndarray]:
         """Finds, in the original DataFrame, the subjects that didn't answer
-        all questions, and replaces that missing value with the mean of the
-        other grades for that student.
+       all questions, and replaces that missing value with the mean of the
+       other grades for that student.
 
-        Returns
-        -------
-        df : pd.DataFrame
-          The corrected DataFrame after insertion of the mean grade
-        arr : np.ndarray
-              Row indices of the students that their new grades were generated
-        """
+       Returns
+       -------
+       df : pd.DataFrame
+         The corrected DataFrame after insertion of the mean grade
+       arr : np.ndarray
+             Row indices of the students that their new grades were generated
+       """
         df = self.data.copy()
-        questions = ['q1', 'q2', 'q3', 'q4', 'q5']
+        q_cols = ['q1', 'q2', 'q3', 'q4', 'q5']
+        rows_to_correct = df[q_cols].isnull().any(axis=1)
+        indices = np.where(rows_to_correct)[0]
 
-        # Convert question columns to numeric, "nan" strings become NaN
-        for q in questions:
-            df[q] = pd.to_numeric(df[q], errors='coerce')
+        for i in indices:
+            row_mean = df.loc[i, q_cols].mean()
+            df.loc[i, q_cols] = df.loc[i, q_cols].fillna(row_mean)
 
-        corrected_indices = []
-
-        for idx, row in df.iterrows():
-            question_values = row[questions]
-            
-            # Check if there are any NaN values
-            if question_values.isna().any():
-                # Calculate mean of non-NaN values
-                mean_val = question_values.mean()
-                
-                # Only fill if we have at least one valid score to calculate mean
-                if not pd.isna(mean_val):
-                    # Fill NaN values with the mean
-                    for q in questions:
-                        if pd.isna(row[q]):
-                            df.at[idx, q] = mean_val
-                    corrected_indices.append(idx)
-
-        return df, np.array(corrected_indices)
+        return df, indices
 
     def score_subjects(self, maximal_nans_per_sub: int = 1) -> pd.DataFrame:
         """Calculates the average score of a subject and adds a new "score" column
-        with it.
+       with it.
 
-        If the subject has more than "maximal_nans_per_sub" NaN in his grades, the
-        score should be NA. Otherwise, the score is simply the mean of the other grades.
-        The datatype of score is UInt8, and the floating point raw numbers should be
-        rounded down.
+       If the subject has more than "maximal_nans_per_sub" NaN in his grades, the
+       score should be NA. Otherwise, the score is simply the mean of the other grades.
+       The datatype of score is UInt8, and the floating point raw numbers should be
+       rounded down.
 
-        Parameters
-        ----------
-        maximal_nans_per_sub : int, optional
-            Number of allowed NaNs per subject before giving a NA score.
+       Parameters
+       ----------
+       maximal_nans_per_sub : int, optional
+           Number of allowed NaNs per subject before giving a NA score.
 
-        Returns
-        -------
-        pd.DataFrame
-            A new DF with a new column - "score".
-        """
+       Returns
+       -------
+       pd.DataFrame
+           A new DF with a new column - "score".
+       """
         df = self.data.copy()
-        questions = ['q1', 'q2', 'q3', 'q4', 'q5']
+        q_cols = ['q1', 'q2', 'q3', 'q4', 'q5']
 
-        # Convert question columns to numeric
-        for q in questions:
-            df[q] = pd.to_numeric(df[q], errors='coerce')
+        nan_counts = df[q_cols].isnull().sum(axis=1)
+        scores = df[q_cols].mean(axis=1)
+        scores[nan_counts > maximal_nans_per_sub] = np.nan
+        df['score'] = scores.apply(lambda x: np.floor(x) if pd.notna(x) else pd.NA)
+        df['score'] = df['score'].astype('UInt8')
 
-        # Count NaN values per row
-        nan_counts = df[questions].isna().sum(axis=1)
-        
-        # Initialize score column with NaN
-        scores = []
-        
-        for idx, row in df.iterrows():
-            nan_count = nan_counts[idx]
-            
-            if nan_count > maximal_nans_per_sub:
-                scores.append(pd.NA)
-            else:
-                # Calculate mean of non-NaN values and round down
-                question_values = row[questions]
-                if not question_values.isna().all():  # At least one non-NaN value
-                    mean_score = question_values.mean()
-                    score = int(np.floor(mean_score))  # Round down
-                    scores.append(score)
-                else:
-                    scores.append(pd.NA)
-        
-        # Convert to UInt8 (nullable integer type)
-        df['score'] = pd.array(scores, dtype="Int64")  # Use Int64 first
-        df['score'] = df['score'].astype("UInt8")  # Then convert to UInt8
-        
         return df
 
     def correlate_gender_age(self) -> pd.DataFrame:
         """Looks for a correlation between the gender of the subject, their age
-        and the score for all five questions.
+       and the score for all five questions.
 
-        Returns
-        -------
-        pd.DataFrame
-            A DataFrame with a MultiIndex containing the gender and whether the subject is above
-            40 years of age, and the average score in each of the five questions.
-        """
+       Returns
+       -------
+       pd.DataFrame
+           A DataFrame with a MultiIndex containing the gender and whether the subject is above
+           40 years of age, and the average score in each of the five questions.
+       """
         df = self.data.copy()
-        questions = ['q1', 'q2', 'q3', 'q4', 'q5']
-
-        # Convert age and questions to numeric
         df['age'] = pd.to_numeric(df['age'], errors='coerce')
-        for q in questions:
-            df[q] = pd.to_numeric(df[q], errors='coerce')
+        df.dropna(subset=['age'], inplace=True)
+        df['age'] = df['age'].astype(int)
+        
+        df['age_group'] = df['age'] > 40
+        
+        q_cols = ['q1', 'q2', 'q3', 'q4', 'q5']
+        for col in q_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Remove rows with missing gender or age
-        df = df.dropna(subset=['gender', 'age'])
-
-        # Create age group: True if age > 40, False otherwise
-        df['age_above_40'] = df['age'] > 40
-
-        # Group by gender and age_above_40, then calculate mean for each question
-        grouped = df.groupby(['gender', 'age_above_40'])[questions].mean()
-
+        grouped = df.groupby(['gender', 'age_group'])[q_cols].mean()
+        grouped.index.names = ['gender', 'age']
         return grouped
 
-
-# Test the class
-if __name__ == '__main__':
-    # Create instance and read data
-    qa = QuestionnaireAnalysis("data.json")
-    qa.read_data()
-    
-    print("Original data shape:", qa.data.shape)
-    print("First few rows:")
-    print(qa.data.head())
-    
-    # Test each method
-    print("\n=== Testing show_age_distrib ===")
-    hist, bins = qa.show_age_distrib()
-    print("Histogram:", hist)
-    print("Bins:", bins)
-    
-    print("\n=== Testing remove_rows_without_mail ===")
-    clean_df = qa.remove_rows_without_mail()
-    print(f"Removed {len(qa.data) - len(clean_df)} rows with invalid emails")
-    print("Clean data shape:", clean_df.shape)
-    
-    print("\n=== Testing fill_na_with_mean ===")
-    filled_df, corrected_indices = qa.fill_na_with_mean()
-    print(f"Corrected {len(corrected_indices)} rows")
-    print("Corrected indices:", corrected_indices)
-    
-    print("\n=== Testing score_subjects ===")
-    scored_df = qa.score_subjects()
-    print("Score column added:")
-    print(scored_df[['q1', 'q2', 'q3', 'q4', 'q5', 'score']].head())
-    
-    print("\n=== Testing correlate_gender_age ===")
-    correlation_df = qa.correlate_gender_age()
-    print("Correlation results:")
-    print(correlation_df)
-    
+# תיקון לבלוק הראשי
+if __name__ == "__main__":
+    analysis = QuestionnaireAnalysis('data.json')
+    analysis.read_data()
+    analysis.show_age_distrib()
